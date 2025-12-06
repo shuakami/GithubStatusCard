@@ -1,7 +1,5 @@
 # GitHub Stats Card with Xiaohei
 
-## What's New
-
 Added **LuoXiaohei (罗小黑)** character peeking from the top-left corner of the stats card.
 
 ![Stats](https://githubstatus.sdjz.wiki/api/?username=Shuakami&border_radius=12&commits_year=2025&rank_icon=github&ring_color=9b59b6)
