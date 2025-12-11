@@ -604,15 +604,19 @@ const renderStatsCard = (stats, options = {}) => {
     "noctis_minimus", "cobalt2", "swift", "aura", "apprentice",
     "moltack", "codeSTACKr", "rose_pine"
   ].includes(theme.toLowerCase());
-  const xiaoheiYPos = isDarkTheme ? "-121" : "-123";
+  const xiaoheiYPos = isDarkTheme ? "-138" : "-140";
+  // Calculate aspect ratio to maintain image proportions while spanning full width
+  const imageAspectRatio = 4096 / 2048; // original width/height = 2.0 (2:1 ratio)
+  const imageHeight = width / imageAspectRatio;
   const xiaoheiElement = xiaoheiImage
     ? `<image 
-        x="-15" 
+        x="0" 
         y="${xiaoheiYPos}" 
-        width="190" 
-        height="90" 
+        width="${width}" 
+        height="${imageHeight}" 
         href="${xiaoheiImage}"
         opacity="0.95"
+        preserveAspectRatio="xMidYMid slice"
         style="animation: fadeInAnimation 0.8s ease-in-out forwards;"
       />`
     : "";

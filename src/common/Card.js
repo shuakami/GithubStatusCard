@@ -208,13 +208,14 @@ class Card {
   render(body) {
     // Extended viewBox to show xiaohei peeking from outside the card
     const viewBoxPadding = 60;
+    const topPadding = 100; // Increased top padding for full image display
     const verticalOffset = 5; // Card shifted down by 5px
     const bottomPadding = 10; // Small padding at bottom
     return `
       <svg
-        width="${this.width + viewBoxPadding * 2}"
-        height="${this.height + viewBoxPadding + bottomPadding + verticalOffset}"
-        viewBox="-${viewBoxPadding} -${viewBoxPadding} ${this.width + viewBoxPadding * 2} ${this.height + viewBoxPadding + bottomPadding + verticalOffset}"
+              width="${this.width + viewBoxPadding * 2}"
+      height="${this.height + topPadding + bottomPadding + verticalOffset}"
+      viewBox="-${viewBoxPadding} -${topPadding} ${this.width + viewBoxPadding * 2} ${this.height + topPadding + bottomPadding + verticalOffset}"
         fill="none"
         xmlns="http://www.w3.org/2000/svg"
         role="img"
