@@ -20,4 +20,6 @@ Visit: `http://localhost:9000/api/?username=YOUR_USERNAME`
 
 Add `PAT_1` environment variable with your GitHub token on Vercel.
 
+Optional: add `DATABASE_URL` (Neon Postgres connection string) to enable a persistent stats cache — past-year stats are cached for 30 days, current data refreshes every 6 hours, and stale data is served for up to 24 hours when GitHub requests fail. Without it, the card works exactly as before.
+
 > Fork from [anuraghazra/github-readme-stats](https://github.com/anuraghazra/github-readme-stats)

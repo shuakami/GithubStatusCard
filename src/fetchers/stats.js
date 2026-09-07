@@ -10,6 +10,11 @@ import { excludeRepositories } from "../common/envs.js";
 import { CustomError, MissingParamError } from "../common/error.js";
 import { wrapTextMultiline } from "../common/fmt.js";
 import { request } from "../common/http.js";
+import {
+  readCacheEntry,
+  writeCacheEntry,
+  MAX_STALE_TTL_SECONDS,
+} from "../common/kv-store.js";
 
 dotenv.config();
 
@@ -110,6 +115,36 @@ const contributedToCache = new Map();
 
 const DEFAULT_CONTRIBUTED_TO_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 
+// Fresh TTLs for the persistent stats cache. Past years are immutable, so a
+// 30-day retention is safe; the current year is still accruing, so refresh it
+// every 6 hours while stale entries stay servable for a full day.
+const FRESH_TTL_CURRENT_YEAR_SECONDS = 6 * 60 * 60;
+const FRESH_TTL_PAST_YEAR_SECONDS = MAX_STALE_TTL_SECONDS;
+const STALE_SERVE_SECONDS = 24 * 60 * 60;
+
+const getYear = () => new Date().getUTCFullYear();
+
+/**
+ * Cache key covering every input that changes the computed stats, so two
+ * requests with different render inputs never share an entry.
+ *
+ * @param {string} username GitHub username.
+ * @param {object} opts Key inputs.
+ * @param {boolean} opts.includeAllCommits Whether REST total-commits is used.
+ * @param {number|undefined} opts.year Commits year filter.
+ * @param {boolean} opts.mergedPRs Whether merged-PR counts are included.
+ * @param {boolean} opts.discussions Whether discussion counts are included.
+ * @param {boolean} opts.discussionsAnswers Whether answer counts are included.
+ * @param {string[]} opts.excludeRepo Repositories excluded from star totals.
+ * @returns {string} Cache key.
+ */
+const getStatsCacheKey = (username, opts) =>
+  `stats:${username.toLowerCase()}:${opts.includeAllCommits ? 1 : 0}:${
+    opts.year || "all"
+  }:${opts.mergedPRs ? 1 : 0}:${opts.discussions ? 1 : 0}:${
+    opts.discussionsAnswers ? 1 : 0
+  }:${[...new Set(opts.excludeRepo)].sort().join(".")}`;
+
 /**
  * @returns {number} Cache TTL in ms for contributed-to counts.
  */
@@ -129,8 +164,8 @@ const clearContributedToCache = () => {
 };
 
 /**
- * @param {string} username
- * @returns {{ value: number, exact: boolean } | null}
+ * @param {string} username GitHub username.
+ * @returns {{ value: number, exact: boolean } | null} Cached entry or null.
  */
 const readContributedToCache = (username) => {
   const key = username.toLowerCase();
@@ -146,9 +181,9 @@ const readContributedToCache = (username) => {
 };
 
 /**
- * @param {string} username
- * @param {number} value
- * @param {boolean} exact
+ * @param {string} username GitHub username.
+ * @param {number} value Contributed-to count.
+ * @param {boolean} exact Whether the value is the canonical count.
  */
 const writeContributedToCache = (username, value, exact) => {
   contributedToCache.set(username.toLowerCase(), {
@@ -179,9 +214,9 @@ const fetcher = (variables, token) => {
 };
 
 /**
- * @param {object} variables
- * @param {string} token
- * @returns {Promise<import('axios').AxiosResponse>}
+ * @param {object} variables Fetcher variables.
+ * @param {string} token GitHub token.
+ * @returns {Promise<import('axios').AxiosResponse>} Axios response.
  */
 const contributedToExactFetcher = (variables, token) =>
   request(
@@ -193,9 +228,9 @@ const contributedToExactFetcher = (variables, token) =>
   );
 
 /**
- * @param {object} variables
- * @param {string} token
- * @returns {Promise<import('axios').AxiosResponse>}
+ * @param {object} variables Fetcher variables.
+ * @param {string} token GitHub token.
+ * @returns {Promise<import('axios').AxiosResponse>} Axios response.
  */
 const contributedToFallbackFetcher = (variables, token) =>
   request(
@@ -211,8 +246,8 @@ const contributedToFallbackFetcher = (variables, token) =>
  * Prefer exact GraphQL totalCount; on RESOURCE_LIMITS_EXCEEDED use cache then
  * year-scoped commit-repo count.
  *
- * @param {string} username
- * @returns {Promise<number>}
+ * @param {string} username GitHub username.
+ * @returns {Promise<number>} Contributed-to count.
  */
 const fetchContributedToCount = async (username) => {
   const cached = readContributedToCache(username);
@@ -349,6 +384,7 @@ const fetchTotalCommits = (variables, token) => {
       Accept: "application/vnd.github.cloak-preview",
       Authorization: `token ${token}`,
     },
+    timeout: 7000,
   });
 };
 
@@ -411,6 +447,31 @@ const fetchStats = async (
     throw new MissingParamError(["username"]);
   }
 
+  if (include_all_commits && !githubUsernameRegex.test(username)) {
+    logger.log("Invalid username provided.");
+    throw new Error("Invalid username provided.");
+  }
+
+  // Warm persistent cache read. A fresh entry skips GitHub entirely — this is
+  // what keeps Camo reloads and cold instances fast.
+  const cacheKey = getStatsCacheKey(username, {
+    includeAllCommits: include_all_commits,
+    year: commits_year,
+    mergedPRs: include_merged_pull_requests,
+    discussions: include_discussions,
+    discussionsAnswers: include_discussions_answers,
+    excludeRepo: [...exclude_repo, ...excludeRepositories],
+  });
+  const freshTtl =
+    commits_year && commits_year < getYear()
+      ? FRESH_TTL_PAST_YEAR_SECONDS
+      : FRESH_TTL_CURRENT_YEAR_SECONDS;
+
+  const cached = await readCacheEntry(cacheKey);
+  if (cached && cached.age < freshTtl && cached.value && cached.value.rank) {
+    return cached.value;
+  }
+
   const stats = {
     name: "",
     totalPRs: 0,
@@ -426,17 +487,32 @@ const fetchStats = async (
     rank: { level: "C", percentile: 100 },
   };
 
-  // Main stats and contributed-to run in parallel for latency.
-  const [res, contributedTo] = await Promise.all([
-    statsFetcher({
-      username,
-      includeMergedPullRequests: include_merged_pull_requests,
-      includeDiscussions: include_discussions,
-      includeDiscussionsAnswers: include_discussions_answers,
-      startTime: commits_year ? `${commits_year}-01-01T00:00:00Z` : undefined,
-    }),
-    fetchContributedToCount(username),
-  ]);
+  let res, contributedTo, totalCommits;
+  try {
+    [res, contributedTo, totalCommits] = await Promise.all([
+      statsFetcher({
+        username,
+        includeMergedPullRequests: include_merged_pull_requests,
+        includeDiscussions: include_discussions,
+        includeDiscussionsAnswers: include_discussions_answers,
+        startTime: commits_year ? `${commits_year}-01-01T00:00:00Z` : undefined,
+      }),
+      fetchContributedToCount(username),
+      include_all_commits
+        ? totalCommitsFetcher(username, commits_year).catch((err) => {
+            logger.log(`totalCommits fetch failed for ${username}: ${err}`);
+            return null;
+          })
+        : Promise.resolve(null),
+    ]);
+  } catch (err) {
+    // Network/timeout failures: stale cache beats an error card.
+    if (cached && cached.age < STALE_SERVE_SECONDS && cached.value?.rank) {
+      logger.log(`serving stale stats for ${username} (fetch threw: ${err})`);
+      return cached.value;
+    }
+    throw err;
+  }
 
   // Catch GraphQL errors.
   if (res.data.errors) {
@@ -446,6 +522,14 @@ const fetchStats = async (
         res.data.errors[0].message || "Could not fetch user.",
         CustomError.USER_NOT_FOUND,
       );
+    }
+    if (cached && cached.age < STALE_SERVE_SECONDS && cached.value?.rank) {
+      logger.log(
+        `serving stale stats for ${username} (GraphQL errors: ${JSON.stringify(
+          res.data.errors[0],
+        )})`,
+      );
+      return cached.value;
     }
     if (res.data.errors[0].message) {
       throw new CustomError(
@@ -463,13 +547,24 @@ const fetchStats = async (
 
   stats.name = user.name || user.login;
 
-  // if include_all_commits, fetch all commits using the REST API (includes org commits).
   if (include_all_commits) {
-    stats.totalCommits = await totalCommitsFetcher(username, commits_year);
+    if (totalCommits === null) {
+      // Upstream failed: serve stale cache when available, otherwise error card.
+      if (cached && cached.age < STALE_SERVE_SECONDS && cached.value?.rank) {
+        logger.log(`serving stale stats for ${username} (commits fetch failed)`);
+        return cached.value;
+      }
+      throw new CustomError(
+        "Could not fetch total commits.",
+        CustomError.GITHUB_REST_API_ERROR,
+      );
+    }
+    stats.totalCommits = totalCommits;
   } else {
     // Use GraphQL contributions (personal repos only, but respects time range)
     stats.totalCommits = user.commits.totalCommitContributions;
   }
+  stats.contributedTo = contributedTo;
 
   stats.totalPRs = user.pullRequests.totalCount;
   if (include_merged_pull_requests) {
@@ -487,7 +582,6 @@ const fetchStats = async (
     stats.totalDiscussionsAnswered =
       user.repositoryDiscussionComments.totalCount;
   }
-  stats.contributedTo = contributedTo;
 
   // Retrieve stars while filtering out repositories to be hidden.
   const allExcludedRepos = [...exclude_repo, ...excludeRepositories];
@@ -511,6 +605,8 @@ const fetchStats = async (
     stars: stats.totalStars,
     followers: user.followers.totalCount,
   });
+
+  await writeCacheEntry(cacheKey, stats);
 
   return stats;
 };
